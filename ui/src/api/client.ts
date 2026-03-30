@@ -12,6 +12,24 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Retrieve the Wayve auth token from localStorage.
+ * Wayve's MSAL stores tokens under 'wayve_auth_tokens' (set by AuthContext.tsx).
+ * Since Paperclip UI is served from the same origin (gowayve.com/agents/*),
+ * it has access to the same localStorage.
+ */
+function getWayveToken(): string | null {
+  try {
+    const stored = localStorage.getItem("wayve_auth_tokens");
+    if (!stored) return null;
+    const tokens = JSON.parse(stored) as { accessToken?: string; idToken?: string; expiresAt?: number };
+    // Wayve uses idToken as the Bearer token (see AuthContext.tsx line 204)
+    return tokens.idToken ?? tokens.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers ?? undefined);
   const body = init?.body;
@@ -19,9 +37,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
+  // Attach Wayve JWT as Bearer token if available (for Wayve-integrated mode)
+  const wayveToken = getWayveToken();
+  if (wayveToken && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${wayveToken}`);
+  }
+
   const res = await fetch(`${BASE}${path}`, {
     headers,
-    credentials: "include",
+    credentials: "include", // Keep cookie auth as fallback for standalone Paperclip mode
     ...init,
   });
   if (!res.ok) {

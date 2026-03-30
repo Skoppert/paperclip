@@ -43,11 +43,29 @@ async function authPost(path: string, body: Record<string, unknown>) {
   return payload;
 }
 
+function getWayveToken(): string | null {
+  try {
+    const stored = localStorage.getItem("wayve_auth_tokens");
+    if (!stored) return null;
+    const tokens = JSON.parse(stored) as { idToken?: string; accessToken?: string };
+    return tokens.idToken ?? tokens.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function buildAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  const token = getWayveToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 export const authApi = {
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
       credentials: "include",
-      headers: { Accept: "application/json" },
+      headers: buildAuthHeaders(),
     });
     if (res.status === 401) return null;
     const payload = await res.json().catch(() => null);

@@ -8,6 +8,7 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { tryWayveJwtAuth } from "./wayve-auth.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -82,6 +83,25 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    // ── Wayve JWT check (Microsoft Entra ID token) ─────────────────────
+    // Try Wayve JWT first — if the token is a valid Entra JWT, authenticate
+    // as a board user with auto-provisioned company access.
+    const wayveAuth = await tryWayveJwtAuth(db, token);
+    if (wayveAuth) {
+      req.actor = {
+        type: "board",
+        userId: wayveAuth.userId,
+        companyIds: wayveAuth.companyIds,
+        isInstanceAdmin: false,
+        keyId: undefined,
+        runId: runIdHeader ?? undefined,
+        source: "session", // Use "session" source so assertCompanyAccess works correctly
+      };
+      next();
+      return;
+    }
+
+    // ── Existing auth paths (Paperclip API keys, agent JWT) ────────────
     const boardKey = await boardAuth.findBoardApiKeyByToken(token);
     if (boardKey) {
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
