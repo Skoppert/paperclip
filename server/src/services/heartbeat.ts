@@ -1924,6 +1924,17 @@ export function heartbeatService(db: Db) {
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
+        // Skip local execution for remote adapters — these are picked up by
+        // the Wayve CLI runner which polls GET /api/runners/pending.
+        if (agent.adapterType?.startsWith("remote_")) {
+          logger.info({ runId: claimedRun.id, agentId, adapterType: agent.adapterType },
+            "Remote adapter run queued — waiting for external runner to claim");
+          // Revert the claim so the runner can pick it up
+          await db.update(heartbeatRuns)
+            .set({ status: "queued", updatedAt: new Date() })
+            .where(eq(heartbeatRuns.id, claimedRun.id));
+          continue;
+        }
         void executeRun(claimedRun.id).catch((err) => {
           logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
         });
