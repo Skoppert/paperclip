@@ -90,7 +90,7 @@ export function runnerRoutes(db: Db) {
 
         // Build prompt from adapter config template or context
         const promptTemplate = (config.promptTemplate as string) ?? "";
-        const prompt = promptTemplate || (context.prompt as string) ?? `You are ${run.agentName}. Complete your assigned tasks.`;
+        const prompt = promptTemplate || ((context.prompt as string) ?? `You are ${run.agentName}. Complete your assigned tasks.`);
 
         // Resolve environment variables (secrets are NOT sent — runner must have them locally)
         const env: Record<string, string> = {};
