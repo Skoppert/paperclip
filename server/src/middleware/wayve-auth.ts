@@ -165,14 +165,27 @@ async function findOrCreateUser(
 
   const now = new Date();
 
-  await db.insert(authUsers).values({
-    id: claims.userId,
-    name: claims.name || claims.email || "Wayve User",
-    email: claims.email || `${claims.userId}@wayve.local`,
-    emailVerified: true, // Wayve/Entra already verified the email
-    createdAt: now,
-    updatedAt: now,
-  });
+  // Use try/catch to handle concurrent first-requests for the same user (TOCTOU race).
+  // If two requests arrive simultaneously, both pass the SELECT check,
+  // but only one INSERT succeeds. The other catches the duplicate key error
+  // and continues to company provisioning.
+  try {
+    await db.insert(authUsers).values({
+      id: claims.userId,
+      name: claims.name || claims.email || "Wayve User",
+      email: claims.email || `${claims.userId}@wayve.local`,
+      emailVerified: true, // Wayve/Entra already verified the email
+      createdAt: now,
+      updatedAt: now,
+    });
+  } catch (error: unknown) {
+    // Duplicate key (user was created by a concurrent request) — safe to continue
+    const isDuplicate = error instanceof Error
+      && "code" in error
+      && (error as { code?: string }).code === "23505";
+    if (!isDuplicate) throw error;
+    logger.debug({ userId: claims.userId }, "User already exists (concurrent create), continuing");
+  }
 
   const companyId = await createDefaultCompany(db, claims);
 
@@ -274,9 +287,11 @@ export async function tryWayveJwtAuth(
     return null;
   }
 
-  // Quick heuristic: Entra JWTs are typically 800+ characters with 2 dots.
+  // PERFORMANCE HEURISTIC ONLY — not a security gate.
+  // Entra JWTs are typically 800+ characters with 2 dots.
   // Agent API keys and Paperclip agent JWTs are shorter.
   // This avoids expensive JWKS lookups for non-Entra tokens.
+  // Security is enforced by jwtVerify() below (RSA signature + audience + issuer).
   const dotCount = token.split(".").length - 1;
   if (dotCount !== 2 || token.length < 500) {
     return null;

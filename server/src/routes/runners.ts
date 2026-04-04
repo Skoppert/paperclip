@@ -1,16 +1,19 @@
 /**
  * Runner API routes — endpoints for the Wayve CLI Agent Runner.
  *
- * These endpoints allow external runners (on user's laptops) to:
- * 1. Poll for queued heartbeat runs that need remote execution
- * 2. Claim a run atomically (preventing double execution)
- * 3. Report execution results (costs, tokens, session state)
- *
- * All endpoints require board-level authentication (Wayve JWT).
+ * Security model:
+ * - All endpoints require board-level authentication (Wayve JWT)
+ * - Data is scoped by companyIds from the authenticated actor
+ * - Authorization is checked BEFORE any writes
+ * - Cost data is clamped to non-negative values
+ * - adapterConfig secrets are stripped via allowlist
+ * - Duplicate finalization is rejected
+ * - In-memory rate limiting per user
  */
 
 import { Router } from "express";
 import { and, eq, inArray } from "drizzle-orm";
+import type { Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -22,17 +25,89 @@ import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { logger } from "../middleware/logger.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 
+// ── Security helpers ───────────────────────────────────────────────────────
+
+const SENSITIVE_KEY_PATTERN = /(key|token|secret|password|passwd|auth|credential|bearer|private)/i;
+
+/** Allowlist of safe adapterConfig fields to send to the runner. */
+function sanitizeAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+  return {
+    model: config.model,
+    cwd: config.cwd,
+    promptTemplate: config.promptTemplate,
+    timeoutSec: config.timeoutSec,
+    graceSec: config.graceSec,
+    maxTurnsPerRun: config.maxTurnsPerRun,
+    dangerouslySkipPermissions: config.dangerouslySkipPermissions,
+    extraArgs: config.extraArgs,
+  };
+}
+
+/** Strip sensitive env vars using broad pattern matching. */
+function sanitizeEnv(env: Record<string, string> | undefined): Record<string, string> {
+  if (!env) return {};
+  const safe: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!SENSITIVE_KEY_PATTERN.test(key)) {
+      safe[key] = value;
+    }
+  }
+  return safe;
+}
+
+/** Clamp to non-negative integer. Prevents budget manipulation via negative values. */
+function clampNonNeg(value: number | null | undefined): number {
+  return Math.max(0, Math.floor(Number(value) || 0));
+}
+
+// ── Rate limiting (in-memory, per userId) ──────────────────────────────────
+
+const rateLimitMap = new Map<string, number[]>();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+function isRateLimited(userId: string, maxPerMinute: number): boolean {
+  const now = Date.now();
+  const timestamps = rateLimitMap.get(userId) ?? [];
+  const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+
+  if (recent.length >= maxPerMinute) {
+    rateLimitMap.set(userId, recent);
+    return true;
+  }
+
+  recent.push(now);
+  rateLimitMap.set(userId, recent);
+  return false;
+}
+
+// Clean up stale entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamps] of rateLimitMap.entries()) {
+    const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    if (recent.length === 0) {
+      rateLimitMap.delete(key);
+    } else {
+      rateLimitMap.set(key, recent);
+    }
+  }
+}, 5 * 60_000).unref();
+
+// ── Routes ─────────────────────────────────────────────────────────────────
+
 export function runnerRoutes(db: Db) {
   const router = Router();
 
   // ── GET /runners/pending ─────────────────────────────────────────────
-  // Returns queued heartbeat runs for agents with remote adapter types.
-  // The runner polls this endpoint every 30 seconds.
   router.get("/runners/pending", async (req, res) => {
-    try {
-      assertBoard(req);
-    } catch {
+    try { assertBoard(req); } catch {
       res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const userId = req.actor.userId ?? "unknown";
+    if (isRateLimited(`pending:${userId}`, 10)) {
+      res.status(429).json({ error: "Too many requests. Max 10/min for polling." });
       return;
     }
 
@@ -43,17 +118,13 @@ export function runnerRoutes(db: Db) {
     }
 
     try {
-      // Find queued runs for agents with remote_* adapter types
       const queuedRuns = await db
         .select({
           runId: heartbeatRuns.id,
           agentId: heartbeatRuns.agentId,
           companyId: heartbeatRuns.companyId,
           invocationSource: heartbeatRuns.invocationSource,
-          triggerDetail: heartbeatRuns.triggerDetail,
           contextSnapshot: heartbeatRuns.contextSnapshot,
-          wakeupRequestId: heartbeatRuns.wakeupRequestId,
-          createdAt: heartbeatRuns.createdAt,
           agentName: agents.name,
           adapterType: agents.adapterType,
           adapterConfig: agents.adapterConfig,
@@ -68,52 +139,33 @@ export function runnerRoutes(db: Db) {
         )
         .limit(10);
 
-      // Filter for remote adapter types and build response
       const pending = [];
       for (const run of queuedRuns) {
         const adapterType = run.adapterType ?? "claude_local";
-        // Accept both remote_* prefixed adapters and regular adapters
-        // (the runner can handle any adapter type it supports)
-        if (!adapterType.startsWith("remote_") && adapterType !== "claude_local") {
-          continue;
-        }
+        if (!adapterType.startsWith("remote_") && adapterType !== "claude_local") continue;
 
         const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
         const config = (run.adapterConfig ?? {}) as Record<string, unknown>;
 
-        // Resolve session state for this agent
         const runtimeState = await db
-          .select({ sessionParams: agentRuntimeState.sessionParams })
+          .select({ stateJson: agentRuntimeState.stateJson })
           .from(agentRuntimeState)
           .where(eq(agentRuntimeState.agentId, run.agentId))
-          .then((rows: Array<{ sessionParams: unknown }>) => rows[0] ?? null);
+          .then((rows: Array<{ stateJson: Record<string, unknown> }>) => rows[0] ?? null);
 
-        // Build prompt from adapter config template or context
         const promptTemplate = (config.promptTemplate as string) ?? "";
         const prompt = promptTemplate || ((context.prompt as string) ?? `You are ${run.agentName}. Complete your assigned tasks.`);
 
-        // Resolve environment variables (secrets are NOT sent — runner must have them locally)
-        const env: Record<string, string> = {};
-        const configEnv = config.env as Record<string, string> | undefined;
-        if (configEnv) {
-          for (const [key, value] of Object.entries(configEnv)) {
-            // Only pass non-secret env vars (secrets should be on the runner machine)
-            if (!key.toLowerCase().includes("secret") && !key.toLowerCase().includes("password")) {
-              env[key] = value;
-            }
-          }
-        }
-
         pending.push({
-          wakeupId: run.runId, // Use run ID as the claim identifier
+          wakeupId: run.runId,
           agentId: run.agentId,
           agentName: run.agentName,
           companyId: run.companyId,
           adapterType,
-          adapterConfig: config,
+          adapterConfig: sanitizeAdapterConfig(config),
           prompt,
-          env,
-          sessionState: (runtimeState?.sessionParams as Record<string, unknown>) ?? null,
+          env: sanitizeEnv(config.env as Record<string, string> | undefined),
+          sessionState: (runtimeState?.stateJson as Record<string, unknown>) ?? null,
           taskId: (context.issueId as string) ?? undefined,
           taskTitle: (context.taskTitle as string) ?? undefined,
           wakeReason: (context.wakeReason as string) ?? run.invocationSource ?? "on_demand",
@@ -128,11 +180,9 @@ export function runnerRoutes(db: Db) {
   });
 
   // ── POST /runners/claim/:runId ───────────────────────────────────────
-  // Atomically claim a queued run. Returns 409 if already claimed.
+  // Authorization is checked BEFORE any writes.
   router.post("/runners/claim/:runId", async (req, res) => {
-    try {
-      assertBoard(req);
-    } catch {
+    try { assertBoard(req); } catch {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -140,55 +190,53 @@ export function runnerRoutes(db: Db) {
     const { runId } = req.params;
 
     try {
-      // Atomic claim: only update if status is still "queued"
-      const claimed = await db
-        .update(heartbeatRuns)
-        .set({
-          status: "running",
-          startedAt: new Date(),
-          updatedAt: new Date(),
+      // Step 1: READ the run (no writes yet)
+      const runRow = await db
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          companyId: heartbeatRuns.companyId,
+          status: heartbeatRuns.status,
         })
-        .where(
-          and(
-            eq(heartbeatRuns.id, runId),
-            eq(heartbeatRuns.status, "queued"),
-          ),
-        )
-        .returning()
-        .then((rows: Array<{ id: string; agentId: string; companyId: string }>) => rows[0] ?? null);
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows: Array<{ id: string; agentId: string; companyId: string; status: string }>) => rows[0] ?? null);
 
-      if (!claimed) {
-        res.status(409).json({ error: "Run already claimed or not found" });
+      if (!runRow) {
+        res.status(404).json({ error: "Run not found" });
         return;
       }
 
-      // Verify company access
+      if (runRow.status !== "queued") {
+        res.status(409).json({ error: "Run already claimed or completed" });
+        return;
+      }
+
+      // Step 2: AUTHORIZE before any writes
       try {
-        assertCompanyAccess(req, claimed.companyId);
+        assertCompanyAccess(req, runRow.companyId);
       } catch {
-        // Revert claim if no access
-        await db
-          .update(heartbeatRuns)
-          .set({ status: "queued", startedAt: null, updatedAt: new Date() })
-          .where(eq(heartbeatRuns.id, runId));
         res.status(403).json({ error: "No access to this company" });
         return;
       }
 
-      // Generate a short-lived agent JWT for the runner's Claude process
-      const agentJwt = createLocalAgentJwt(
-        claimed.agentId,
-        claimed.companyId,
-        "remote_claude_local",
-        runId,
-      );
+      // Step 3: WRITE — atomic claim (still check status=queued for race safety)
+      const claimed = await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date(), updatedAt: new Date() })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows: Array<{ id: string; agentId: string; companyId: string }>) => rows[0] ?? null);
 
+      if (!claimed) {
+        res.status(409).json({ error: "Run was claimed by another runner" });
+        return;
+      }
+
+      const agentJwt = createLocalAgentJwt(claimed.agentId, claimed.companyId, "remote_claude_local", runId);
       logger.info({ runId, agentId: claimed.agentId }, "Run claimed by external runner");
 
-      res.json({
-        runId: claimed.id,
-        shortLivedToken: agentJwt ?? "",
-      });
+      res.json({ runId: claimed.id, shortLivedToken: agentJwt ?? "" });
     } catch (err) {
       logger.error({ err, runId }, "Failed to claim run");
       res.status(500).json({ error: "Internal server error" });
@@ -196,12 +244,16 @@ export function runnerRoutes(db: Db) {
   });
 
   // ── POST /runners/heartbeat-done ─────────────────────────────────────
-  // Report execution results from the runner.
+  // Rejects duplicates, clamps costs to non-negative.
   router.post("/runners/heartbeat-done", async (req, res) => {
-    try {
-      assertBoard(req);
-    } catch {
+    try { assertBoard(req); } catch {
       res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const userId = req.actor.userId ?? "unknown";
+    if (isRateLimited(`done:${userId}`, 60)) {
+      res.status(429).json({ error: "Too many requests. Max 60/min." });
       return;
     }
 
@@ -226,6 +278,11 @@ export function runnerRoutes(db: Db) {
       return;
     }
 
+    const safeCost = clampNonNeg(body.costCents);
+    const safeIn = clampNonNeg(body.inputTokens);
+    const safeOut = clampNonNeg(body.outputTokens);
+    const safeCached = clampNonNeg(body.cachedInputTokens);
+
     try {
       const run = await db
         .select()
@@ -238,36 +295,28 @@ export function runnerRoutes(db: Db) {
         return;
       }
 
-      // Verify company access
+      // Reject duplicate finalization
+      if (run.status !== "running") {
+        res.status(409).json({ error: `Run is already ${run.status}` });
+        return;
+      }
+
       assertCompanyAccess(req, run.companyId);
 
-      // Update the heartbeat run with results
       const finishStatus = body.status === "completed" ? "completed" : "failed";
-      await db
-        .update(heartbeatRuns)
-        .set({
-          status: finishStatus,
-          finishedAt: new Date(),
-          exitCode: body.exitCode,
-          error: body.error ?? null,
-          stdoutExcerpt: body.stdoutExcerpt?.slice(0, 32 * 1024) ?? null,
-          usageJson: {
-            inputTokens: body.inputTokens ?? 0,
-            outputTokens: body.outputTokens ?? 0,
-            cachedInputTokens: body.cachedInputTokens ?? 0,
-          },
-          resultJson: {
-            costUsd: (body.costCents ?? 0) / 100,
-            provider: body.provider,
-            model: body.model,
-            summary: body.summary,
-          },
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, body.runId));
 
-      // Record cost event
-      if (body.costCents > 0) {
+      await db.update(heartbeatRuns).set({
+        status: finishStatus,
+        finishedAt: new Date(),
+        exitCode: body.exitCode,
+        error: body.error ?? null,
+        stdoutExcerpt: body.stdoutExcerpt?.slice(0, 32 * 1024) ?? null,
+        usageJson: { inputTokens: safeIn, outputTokens: safeOut, cachedInputTokens: safeCached },
+        resultJson: { costUsd: safeCost / 100, provider: body.provider, model: body.model, summary: body.summary },
+        updatedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, body.runId));
+
+      if (safeCost > 0) {
         await db.insert(costEvents).values({
           companyId: run.companyId,
           agentId: run.agentId,
@@ -276,15 +325,18 @@ export function runnerRoutes(db: Db) {
           biller: "api",
           billingType: "api",
           model: body.model ?? "unknown",
-          inputTokens: body.inputTokens ?? 0,
-          cachedInputTokens: body.cachedInputTokens ?? 0,
-          outputTokens: body.outputTokens ?? 0,
-          costCents: body.costCents,
+          inputTokens: safeIn,
+          cachedInputTokens: safeCached,
+          outputTokens: safeOut,
+          costCents: safeCost,
           occurredAt: new Date(),
         });
+      } else if (safeIn + safeOut > 0) {
+        logger.warn({ runId: body.runId, inputTokens: safeIn, outputTokens: safeOut },
+          "Run reported zero cost with non-zero tokens");
       }
 
-      // Update agent's monthly spend and last heartbeat timestamp
+      // Update agent spend (safeCost is already >= 0)
       const agent = await db
         .select({ spentMonthlyCents: agents.spentMonthlyCents })
         .from(agents)
@@ -292,51 +344,42 @@ export function runnerRoutes(db: Db) {
         .then((rows: Array<{ spentMonthlyCents: number }>) => rows[0] ?? null);
 
       if (agent) {
-        await db
-          .update(agents)
-          .set({
-            spentMonthlyCents: agent.spentMonthlyCents + (body.costCents ?? 0),
-            lastHeartbeatAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(agents.id, run.agentId));
+        await db.update(agents).set({
+          spentMonthlyCents: agent.spentMonthlyCents + safeCost,
+          lastHeartbeatAt: new Date(),
+          updatedAt: new Date(),
+        }).where(eq(agents.id, run.agentId));
       }
 
       // Persist session state for next run
       if (body.sessionState) {
         const existing = await db
-          .select({ id: agentRuntimeState.id })
+          .select({ agentId: agentRuntimeState.agentId })
           .from(agentRuntimeState)
           .where(eq(agentRuntimeState.agentId, run.agentId))
-          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+          .then((rows: Array<{ agentId: string }>) => rows[0] ?? null);
 
         if (existing) {
-          await db
-            .update(agentRuntimeState)
-            .set({
-              sessionParams: body.sessionState,
-              updatedAt: new Date(),
-            })
-            .where(eq(agentRuntimeState.agentId, run.agentId));
+          await db.update(agentRuntimeState).set({
+            stateJson: body.sessionState, updatedAt: new Date(),
+          }).where(eq(agentRuntimeState.agentId, run.agentId));
         } else {
+          const agentRecord = await db
+            .select({ adapterType: agents.adapterType })
+            .from(agents)
+            .where(eq(agents.id, run.agentId))
+            .then((rows: Array<{ adapterType: string }>) => rows[0] ?? null);
+
           await db.insert(agentRuntimeState).values({
             agentId: run.agentId,
             companyId: run.companyId,
-            sessionParams: body.sessionState,
+            adapterType: agentRecord?.adapterType ?? "remote_claude_local",
+            stateJson: body.sessionState,
           });
         }
       }
 
-      logger.info(
-        {
-          runId: body.runId,
-          status: finishStatus,
-          costCents: body.costCents,
-          tokens: (body.inputTokens ?? 0) + (body.outputTokens ?? 0),
-        },
-        "External runner reported heartbeat result",
-      );
-
+      logger.info({ runId: body.runId, status: finishStatus, costCents: safeCost }, "Runner reported heartbeat result");
       res.json({ ok: true });
     } catch (err) {
       logger.error({ err, runId: body.runId }, "Failed to process heartbeat result");
