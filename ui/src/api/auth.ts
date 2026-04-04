@@ -43,16 +43,7 @@ async function authPost(path: string, body: Record<string, unknown>) {
   return payload;
 }
 
-function getWayveToken(): string | null {
-  try {
-    const stored = localStorage.getItem("wayve_auth_tokens");
-    if (!stored) return null;
-    const tokens = JSON.parse(stored) as { idToken?: string; accessToken?: string };
-    return tokens.idToken ?? tokens.accessToken ?? null;
-  } catch {
-    return null;
-  }
-}
+import { getWayveToken } from "../lib/wayve-token";
 
 function buildAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = { Accept: "application/json" };

@@ -106,6 +106,8 @@ function extractClaims(payload: JWTPayload): WayveUserClaims | null {
 interface ProvisionResult {
   userId: string;
   companyIds: string[];
+  email: string;
+  name: string;
 }
 
 // In-memory cache to avoid DB lookups on every request
@@ -150,7 +152,7 @@ async function findOrCreateUser(
       companyIds.push(companyId);
     }
 
-    const result = { userId: claims.userId, companyIds };
+    const result = { userId: claims.userId, companyIds, email: claims.email, name: claims.name };
     provisionCache.set(claims.userId, { result, expiresAt: Date.now() + CACHE_TTL_MS });
     return result;
   }
@@ -178,7 +180,7 @@ async function findOrCreateUser(
   // Not granting instance_admin — each Wayve user is just a regular board member
   // of their own company. Instance admin is reserved for the platform operator.
 
-  const result = { userId: claims.userId, companyIds: [companyId] };
+  const result = { userId: claims.userId, companyIds: [companyId], email: claims.email, name: claims.name };
   provisionCache.set(claims.userId, { result, expiresAt: Date.now() + CACHE_TTL_MS });
   return result;
 }
@@ -251,6 +253,8 @@ function derivePrefix(input: string): string {
 export interface WayveAuthResult {
   userId: string;
   companyIds: string[];
+  email: string;
+  name: string;
 }
 
 /**

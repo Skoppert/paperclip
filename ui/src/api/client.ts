@@ -12,23 +12,7 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * Retrieve the Wayve auth token from localStorage.
- * Wayve's MSAL stores tokens under 'wayve_auth_tokens' (set by AuthContext.tsx).
- * Since Paperclip UI is served from the same origin (gowayve.com/agents/*),
- * it has access to the same localStorage.
- */
-function getWayveToken(): string | null {
-  try {
-    const stored = localStorage.getItem("wayve_auth_tokens");
-    if (!stored) return null;
-    const tokens = JSON.parse(stored) as { accessToken?: string; idToken?: string; expiresAt?: number };
-    // Wayve uses idToken as the Bearer token (see AuthContext.tsx line 204)
-    return tokens.idToken ?? tokens.accessToken ?? null;
-  } catch {
-    return null;
-  }
-}
+import { getWayveToken } from "../lib/wayve-token";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers ?? undefined);

@@ -95,7 +95,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         isInstanceAdmin: false,
         keyId: undefined,
         runId: runIdHeader ?? undefined,
-        source: "session", // Use "session" source so assertCompanyAccess works correctly
+        source: "session",
+        email: wayveAuth.email,
+        name: wayveAuth.name,
       };
       next();
       return;
