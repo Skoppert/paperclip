@@ -17,8 +17,13 @@ interface StoredNativeTokens {
 /**
  * Get a valid Wayve auth token from either native auth or MSAL storage.
  * Returns the idToken (preferred) or accessToken, or null if not authenticated.
+ *
+ * Also checks URL hash for tokens passed from gowayve.com via cross-domain navigation.
  */
 export function getWayveToken(): string | null {
+  // 0. Check if token was passed via URL hash (cross-domain from gowayve.com)
+  receiveTokenFromUrl();
+
   // 1. Try native auth tokens (email/password login)
   const nativeToken = getNativeAuthToken();
   if (nativeToken) return nativeToken;
@@ -106,5 +111,52 @@ function getMsalToken(): string | null {
     return null;
   } catch {
     return null;
+  }
+}
+
+// ── Cross-domain token transfer (URL hash) ─────────────────────────────────
+
+let urlTokenReceived = false;
+
+/**
+ * Check if a Wayve auth token was passed via URL hash from gowayve.com.
+ * Format: #wayve_token=<base64-encoded JSON of wayve_auth_tokens>
+ *
+ * If found, stores it in localStorage and cleans up the URL hash.
+ * This enables cross-domain auth between gowayve.com and agents.gowayve.com.
+ */
+function receiveTokenFromUrl(): void {
+  if (urlTokenReceived) return; // Only check once per page load
+  urlTokenReceived = true;
+
+  try {
+    const hash = window.location.hash;
+    if (!hash || !hash.includes("wayve_token=")) return;
+
+    const params = new URLSearchParams(hash.slice(1)); // Remove '#'
+    const encoded = params.get("wayve_token");
+    if (!encoded) return;
+
+    const decoded = atob(encoded);
+    const tokens = JSON.parse(decoded) as StoredNativeTokens;
+
+    // Validate it looks like a real token object
+    if (!tokens.idToken && !tokens.accessToken) return;
+
+    // Store in this domain's localStorage
+    localStorage.setItem("wayve_auth_tokens", decoded);
+
+    // Clean up URL hash (remove token from address bar)
+    const cleanHash = hash
+      .replace(/[#&]?wayve_token=[^&]*/, "")
+      .replace(/^#$/, "");
+    if (cleanHash) {
+      window.location.hash = cleanHash;
+    } else {
+      // Remove hash entirely
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+  } catch {
+    // Silently ignore — token transfer is best-effort
   }
 }
