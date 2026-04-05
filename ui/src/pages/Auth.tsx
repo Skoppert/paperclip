@@ -56,13 +56,10 @@ export function AuthPage() {
       console.warn("Wayve token exists but Paperclip session failed after retries. Redirecting to Wayve login.");
     }
 
-    // No Wayve token or retries exhausted — redirect to Wayve login
-    const wayveLoginUrl = window.location.origin + "/auth";
-
-    // Avoid redirect loop: if we're already on /auth (Wayve's auth page), don't redirect
-    if (window.location.pathname === "/auth") return;
-
-    window.location.href = wayveLoginUrl;
+    // No Wayve token or retries exhausted — redirect to Wayve auth bridge
+    // The auth bridge on gowayve.com reads the token and redirects back with it in the hash
+    const returnUrl = encodeURIComponent(window.location.origin);
+    window.location.href = `https://www.gowayve.com/auth-bridge?return=${returnUrl}`;
   }, [session, isLoading, error, navigate, nextPath, refetch]);
 
   const message = isLoading
