@@ -22,6 +22,29 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/site.webmanifest" />
     <script>
+      // Wayve cross-domain auth: read token from URL hash BEFORE React loads.
+      // The hash is set by gowayve.com sidebar when clicking "Agents".
+      // Must run before CloudAccessGate redirects to /auth (which drops the hash).
+      (() => {
+        try {
+          const hash = window.location.hash;
+          if (hash && hash.includes("wayve_token=")) {
+            const params = new URLSearchParams(hash.slice(1));
+            const encoded = params.get("wayve_token");
+            if (encoded) {
+              const decoded = atob(encoded);
+              const tokens = JSON.parse(decoded);
+              if (tokens && (tokens.idToken || tokens.accessToken)) {
+                window.localStorage.setItem("wayve_auth_tokens", decoded);
+                // Clean hash from URL
+                history.replaceState(null, "", window.location.pathname + window.location.search);
+              }
+            }
+          }
+        } catch (e) { /* ignore — token transfer is best-effort */ }
+      })();
+    </script>
+    <script>
       (() => {
         const key = "paperclip.theme";
         const darkThemeColor = "#18181b";
